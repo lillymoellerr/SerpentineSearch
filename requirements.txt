@@ -1,0 +1,8 @@
+streamlit>=1.35.0
+open_clip_torch
+torch
+Pillow
+numpy
+google-auth
+google-auth-oauthlib
+google-api-python-client
