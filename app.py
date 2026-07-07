@@ -50,6 +50,12 @@ st.markdown(f"""
   [data-testid="stAppViewContainer"] * {{
       font-family: 'Cormorant Garamond', Georgia, serif;
   }}
+  /* keep icon fonts (e.g. the file uploader's upload icon) rendering as icons, not literal text */
+  [data-testid="stAppViewContainer"] [data-testid*="Icon" i],
+  [data-testid="stAppViewContainer"] [class*="material-symbols" i],
+  [data-testid="stAppViewContainer"] [class*="material-icons" i] {{
+      font-family: 'Material Symbols Outlined', 'Material Icons' !important;
+  }}
   [data-testid="stSidebar"] {{
       background-color: {EMERALD} !important;
   }}
@@ -89,13 +95,17 @@ st.markdown(f"""
       border-radius: 10px;
       margin-top: 4px;
   }}
-  /* force any remaining red accents to emerald */
+  /* slider: ivory handle + track so it is visible against the dark sidebar */
   [data-testid="stSlider"] [role="slider"] {{
-      background-color: {EMERALD} !important;
-      border-color: {EMERALD} !important;
+      background-color: {IVORY} !important;
+      border-color: {IVORY} !important;
+      box-shadow: none !important;
   }}
-  [data-testid="stSlider"] div[style*="background-color: rgb(255"] {{
-      background-color: {EMERALD} !important;
+  [data-testid="stSlider"] div[data-baseweb="slider"] > div > div {{
+      background-color: {IVORY} !important;
+  }}
+  [data-testid="stTickBar"] {{
+      color: {IVORY} !important;
   }}
   /* make inputs/buttons/uploader stand out clearly against any background */
   [data-testid="stTextInput"] input,
@@ -105,19 +115,37 @@ st.markdown(f"""
       border: 1.5px solid {EMERALD} !important;
       border-radius: 6px !important;
   }}
-  .stButton > button {{
-      background-color: #FFFFFF !important;
+  [data-testid="stSidebar"] [data-testid="stTextInput"] input {{
       color: {EMERALD} !important;
+  }}
+  /* buttons: white bg, emerald text/border, override any nested text color */
+  .stButton button,
+  .stButton button[kind="primary"],
+  .stButton button[kind="secondary"] {{
+      background-color: #FFFFFF !important;
       border: 1.5px solid {EMERALD} !important;
       font-weight: 600 !important;
   }}
-  .stButton > button:hover {{
+  .stButton button *,
+  .stButton button[kind="primary"] *,
+  .stButton button[kind="secondary"] * {{
+      color: {EMERALD} !important;
+  }}
+  .stButton button:hover,
+  .stButton button[kind="primary"]:hover,
+  .stButton button[kind="secondary"]:hover {{
       background-color: {EMERALD} !important;
-      color: #FFFFFF !important;
       border: 1.5px solid {EMERALD} !important;
   }}
-  [data-testid="stSidebar"] [data-testid="stTextInput"] input {{
+  .stButton button:hover *,
+  .stButton button[kind="primary"]:hover *,
+  .stButton button[kind="secondary"]:hover * {{
+      color: #FFFFFF !important;
+  }}
+  .stButton button:disabled,
+  .stButton button:disabled * {{
       color: {EMERALD} !important;
+      opacity: 0.5 !important;
   }}
 </style>
 """, unsafe_allow_html=True)
@@ -396,7 +424,7 @@ with st.sidebar:
     st.markdown("### Settings")
     folder_id = st.text_input(
         "Google Drive Folder ID",
-        value=st.session_state.get("folder_id", ""),
+        value=st.session_state.get("folder_id", "18HQhjDRW3cLYlDJxktK50HqObl4GvmIz"),
         placeholder="18HQhjDRW3cLYlDJ…",
         help="The ID from the end of your Drive folder URL",
     )
