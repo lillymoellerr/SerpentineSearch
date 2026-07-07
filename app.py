@@ -41,10 +41,14 @@ SAND    = "#E7E0D0"
 
 st.markdown(f"""
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&display=swap');
   /* global background + font */
   html, body, [data-testid="stAppViewContainer"] {{
       background-color: {IVORY};
-      font-family: Arial, sans-serif;
+      font-family: 'Cormorant Garamond', Georgia, serif;
+  }}
+  [data-testid="stAppViewContainer"] * {{
+      font-family: 'Cormorant Garamond', Georgia, serif;
   }}
   [data-testid="stSidebar"] {{
       background-color: {EMERALD} !important;
@@ -93,6 +97,28 @@ st.markdown(f"""
   [data-testid="stSlider"] div[style*="background-color: rgb(255"] {{
       background-color: {EMERALD} !important;
   }}
+  /* make inputs/buttons/uploader stand out clearly against any background */
+  [data-testid="stTextInput"] input,
+  [data-testid="stFileUploaderDropzone"],
+  [data-testid="stFileUploader"] section {{
+      background-color: #FFFFFF !important;
+      border: 1.5px solid {EMERALD} !important;
+      border-radius: 6px !important;
+  }}
+  .stButton > button {{
+      background-color: #FFFFFF !important;
+      color: {EMERALD} !important;
+      border: 1.5px solid {EMERALD} !important;
+      font-weight: 600 !important;
+  }}
+  .stButton > button:hover {{
+      background-color: {EMERALD} !important;
+      color: #FFFFFF !important;
+      border: 1.5px solid {EMERALD} !important;
+  }}
+  [data-testid="stSidebar"] [data-testid="stTextInput"] input {{
+      color: {EMERALD} !important;
+  }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -101,7 +127,7 @@ LOGO_B64 = "iVBORw0KGgoAAAANSUhEUgAABLAAAAG4CAYAAABVSh4FAAAMP2lDQ1BJQ0MgUHJvZmls
 
 st.markdown(f"""
 <div class="brand-header" style="text-align:center;">
-  <img src="data:image/png;base64,{LOGO_B64}" style="max-width:260px; width:100%; height:auto;" />
+  <img src="data:image/png;base64,{LOGO_B64}" style="max-width:420px; width:100%; height:auto;" />
   <p>Type a description or upload a reference photo to find matching pieces</p>
 </div>
 """, unsafe_allow_html=True)
