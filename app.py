@@ -53,14 +53,8 @@ st.markdown(f"""
       background-color: {IVORY};
       font-family: 'Cormorant Garamond', Georgia, serif;
   }}
-  [data-testid="stAppViewContainer"] * {{
+  [data-testid="stAppViewContainer"] *:not([data-testid*="Icon" i]):not([class*="material-symbols" i]):not([class*="material-icons" i]) {{
       font-family: 'Cormorant Garamond', Georgia, serif;
-  }}
-  /* keep icon fonts (e.g. the file uploader's upload icon) rendering as icons, not literal text */
-  [data-testid="stAppViewContainer"] [data-testid*="Icon" i],
-  [data-testid="stAppViewContainer"] [class*="material-symbols" i],
-  [data-testid="stAppViewContainer"] [class*="material-icons" i] {{
-      font-family: 'Material Symbols Rounded' !important;
   }}
   [data-testid="stSidebar"] {{
       background-color: {EMERALD} !important;
