@@ -24,7 +24,6 @@ from PIL import Image
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Serpentine Jewels · Photo Search",
-    page_icon="💎",
     layout="wide",
 )
 
@@ -94,7 +93,7 @@ st.markdown(f"""
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class="brand-header">
-  <h1>💎 Serpentine Jewels · Photo Search</h1>
+  <h1>Serpentine Jewels · Photo Search</h1>
   <p>Type a description or upload a reference photo to find matching pieces</p>
 </div>
 """, unsafe_allow_html=True)
@@ -287,7 +286,7 @@ def build_index(service, folder_id: str, progress_bar, existing_index=None):
         ]
         if len(still_valid) < len(existing_index["ids"]):
             removed = len(existing_index["ids"]) - len(still_valid)
-            st.info(f"ℹ️ Removed {removed} photo(s) from index that were deleted from Drive.")
+            st.info(f"Removed {removed} photo(s) from index that were deleted from Drive.")
 
         kept_idxs = [i for i, _ in still_valid]
         existing_embs  = existing_index["embeddings"][kept_idxs]
@@ -298,7 +297,7 @@ def build_index(service, folder_id: str, progress_bar, existing_index=None):
         new_files = [f for f in all_files if f["id"] not in indexed_ids]
 
         if not new_files:
-            progress_bar.progress(1.0, text="✅ Already up to date — no new photos found.")
+            progress_bar.progress(1.0, text="Already up to date — no new photos found.")
             return existing_index  # nothing to do
 
         progress_bar.progress(0.0, text=f"Found {len(new_files)} new photo(s) to index…")
@@ -360,7 +359,7 @@ def search(index: dict, query_vec: np.ndarray, top_k: int) -> list[tuple]:
 
 # ── Sidebar: config ───────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Settings")
+    st.markdown("### Settings")
     folder_id = st.text_input(
         "Google Drive Folder ID",
         value=st.session_state.get("folder_id", ""),
@@ -373,20 +372,20 @@ with st.sidebar:
     top_k = st.slider("Results to show", 5, 50, TOP_K_DEFAULT, 5)
 
     st.markdown("---")
-    st.markdown("### 🔄 Index")
+    st.markdown("### Index")
     st.caption(
         "The index lets search run instantly. **Update** adds only new photos "
         "(seconds). **Full Rebuild** reprocesses everything (minutes)."
     )
-    update_btn  = st.button("⚡ Update (new photos only)", type="primary",
+    update_btn  = st.button("Update (new photos only)", type="primary",
                              use_container_width=True)
-    rebuild_btn = st.button("🔁 Full Rebuild", type="secondary",
+    rebuild_btn = st.button("Full Rebuild", type="secondary",
                              use_container_width=True,
                              help="Reprocesses all photos from scratch. "
                                   "Use if search results seem wrong or stale.")
 
     st.markdown("---")
-    st.markdown("### 💡 Search tips")
+    st.markdown("### Search tips")
     st.caption("• **kite diamond three stone ring**")
     st.caption("• **vintage pearl necklace on white**")
     st.caption("• **gold bracelet lifestyle shot**")
@@ -395,7 +394,7 @@ with st.sidebar:
 
 # ── Main: connect & load index ────────────────────────────────────────────────
 if not folder_id:
-    st.info("👈 Paste your Google Drive folder ID in the sidebar to get started.")
+    st.info("Paste your Google Drive folder ID in the sidebar to get started.")
     st.stop()
 
 try:
@@ -424,11 +423,11 @@ if update_btn or rebuild_btn:
 
     added = len(idx["ids"]) - (len(existing["ids"]) if existing else 0)
     if update_btn and added == 0:
-        st.success(f"✅ Already up to date — {len(idx['ids'])} photos indexed.")
+        st.success(f"Already up to date — {len(idx['ids'])} photos indexed.")
     elif update_btn:
-        st.success(f"✅ Added {added} new photo(s). Index now covers {len(idx['ids'])} photos.")
+        st.success(f"Added {added} new photo(s). Index now covers {len(idx['ids'])} photos.")
     else:
-        st.success(f"✅ Full rebuild complete — {len(idx['ids'])} photos indexed.")
+        st.success(f"Full rebuild complete — {len(idx['ids'])} photos indexed.")
 
 # Load index (from session or Drive)
 if "index" not in st.session_state:
@@ -447,7 +446,7 @@ if index is None:
 
 from datetime import datetime
 _now = datetime.now().strftime("%b %d, %H:%M")
-st.caption(f"🗂 Index contains **{len(index['ids'])} photos** · last loaded {_now}")
+st.caption(f"Index contains **{len(index['ids'])} photos** · last loaded {_now}")
 
 # ── Search UI ─────────────────────────────────────────────────────────────────
 col_text, col_upload = st.columns([3, 1])
