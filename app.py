@@ -176,8 +176,12 @@ def load_clip():
 def embed_text(query: str):
     import torch
     model, _, tokenizer, device = load_clip()
+    # CLIP was trained on full photo captions, not bare words — wrapping the
+    # query in a caption-like template gives noticeably better matches for
+    # short/specific searches like "pearl" or "sapphire".
+    prompted = f"a photo of {query.strip()} jewelry"
     with torch.no_grad():
-        tokens = tokenizer([query]).to(device)
+        tokens = tokenizer([prompted]).to(device)
         feat = model.encode_text(tokens)
         feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat.cpu().numpy().astype("float32")[0]
