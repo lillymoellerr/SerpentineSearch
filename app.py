@@ -553,16 +553,29 @@ if results:
     for rank, (fid, name, score) in enumerate(results):
         col = cols[rank % 5]
         with col:
+            raw = None
             try:
                 raw = fetch_image_bytes(service, fid)
                 pil = Image.open(io.BytesIO(raw)).convert("RGB")
-                # Cap display size for speed
-                pil.thumbnail((400, 400))
-                st.image(pil, use_container_width=True)
+                # Cap *display* size only — `raw` above is untouched, full quality
+                display_pil = pil.copy()
+                display_pil.thumbnail((400, 400))
+                st.image(display_pil, use_container_width=True)
             except Exception:
                 st.markdown("_(preview unavailable)_")
             st.caption(f"{name[:28]}{'…' if len(name)>28 else ''}")
             st.caption(f"Match: {score:.0%}")
+            if raw is not None:
+                ext = os.path.splitext(name)[1].lower().lstrip(".") or "jpg"
+                mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
+                st.download_button(
+                    "Download",
+                    data=raw,
+                    file_name=name,
+                    mime=mime,
+                    key=f"dl_{fid}",
+                    use_container_width=True,
+                )
 
 elif query_text.strip() or query_file:
     st.info("No results found — try different search terms.")
