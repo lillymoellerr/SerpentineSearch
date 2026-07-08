@@ -13,10 +13,12 @@ Deploy to Streamlit Cloud:
 
 import io
 import os
+import re
 import json
 import base64
 import tempfile
 
+import requests
 import numpy as np
 import streamlit as st
 from PIL import Image
@@ -35,7 +37,9 @@ st.set_page_config(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-INDEX_FILENAME   = "serpentine_photo_index.npz"
+INDEX_FILENAME         = "serpentine_photo_index.npz"
+WEBSITE_INDEX_FILENAME = "serpentine_website_index.npz"
+PRODUCT_DATA_FILENAME  = "serpentine_product_data.json"
 MODEL_NAME       = "ViT-B-32"
 PRETRAINED       = "laion2b_s34b_b79k"
 DRIVE_FOLDER_KEY = "drive_folder_id"   # stored in st.session_state / secrets
@@ -282,14 +286,19 @@ def fetch_image_bytes(service, file_id: str) -> bytes:
 
 
 # ── Index management ──────────────────────────────────────────────────────────
-def find_index_file(service, folder_id: str):
-    """Return the Drive file ID of the index .npz if it exists."""
+def _find_file_by_name(service, folder_id: str, name: str):
+    """Return the Drive file ID of a file with the given name in this folder, if any."""
     resp = service.files().list(
-        q=f"'{folder_id}' in parents and name='{INDEX_FILENAME}' and trashed=false",
+        q=f"'{folder_id}' in parents and name='{name}' and trashed=false",
         fields="files(id, name)",
     ).execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
+
+
+def find_index_file(service, folder_id: str):
+    """Return the Drive file ID of the index .npz if it exists."""
+    return _find_file_by_name(service, folder_id, INDEX_FILENAME)
 
 
 def load_index(service, folder_id: str):
@@ -422,6 +431,178 @@ def search(index: dict, query_vec: np.ndarray, top_k: int) -> list[tuple]:
     return [(index["ids"][i], index["names"][i], float(sims[i])) for i in order]
 
 
+# ── Website product descriptions (hybrid search) ──────────────────────────────
+@st.cache_resource(show_spinner=False)
+def load_product_data():
+    """Load the bundled Shopify export (title/description/image_url per photo)."""
+    path = os.path.join(os.path.dirname(__file__), PRODUCT_DATA_FILENAME)
+    with open(path, "r") as f:
+        data = json.load(f)
+    return data["images"]  # list of {handle, title, image_url, position, description}
+
+
+def fetch_url_image_bytes(url: str, timeout: int = 20) -> bytes:
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp.content
+
+
+def load_website_index(service, folder_id: str):
+    """Load the pre-built CLIP+description index for website photos, if it exists."""
+    idx_id = _find_file_by_name(service, folder_id, WEBSITE_INDEX_FILENAME)
+    if not idx_id:
+        return None
+    raw = fetch_image_bytes(service, idx_id)
+    data = np.load(io.BytesIO(raw), allow_pickle=True)
+    return {
+        "embeddings":   data["embeddings"],
+        "ids":          [str(x) for x in data["urls"]],
+        "names":        [str(x) for x in data["names"]],
+        "descriptions": [str(x) for x in data["descriptions"]],
+    }
+
+
+def save_website_index(service, folder_id: str, index: dict):
+    """Save / overwrite the website CLIP+description index .npz back to Drive."""
+    from googleapiclient.http import MediaIoBaseUpload
+    buf = io.BytesIO()
+    np.savez(buf,
+             embeddings=index["embeddings"],
+             urls=np.array(index["ids"]),
+             names=np.array(index["names"]),
+             descriptions=np.array(index["descriptions"]))
+    buf.seek(0)
+    media = MediaIoBaseUpload(buf, mimetype="application/octet-stream")
+
+    existing_id = _find_file_by_name(service, folder_id, WEBSITE_INDEX_FILENAME)
+    if existing_id:
+        service.files().update(fileId=existing_id, media_body=media).execute()
+    else:
+        meta = {"name": WEBSITE_INDEX_FILENAME, "parents": [folder_id]}
+        service.files().create(body=meta, media_body=media).execute()
+
+
+def build_website_index(progress_bar, existing_index=None):
+    """
+    Build or incrementally update the website CLIP+description index.
+    Images are downloaded straight from Shopify's CDN (image_url), embedded
+    with CLIP, and paired with the product title/description for keyword boosting.
+    """
+    import torch
+    model, preprocess, _, device = load_clip()
+
+    records = load_product_data()
+
+    if existing_index is not None:
+        indexed_urls = set(existing_index["ids"])
+        new_records = [r for r in records if r["image_url"] not in indexed_urls]
+        existing_embs  = existing_index["embeddings"]
+        existing_ids   = existing_index["ids"]
+        existing_names = existing_index["names"]
+        existing_descs = existing_index["descriptions"]
+
+        if not new_records:
+            progress_bar.progress(1.0, text="Website index already up to date.")
+            return existing_index
+
+        progress_bar.progress(0.0, text=f"Found {len(new_records)} new website photo(s)…")
+    else:
+        new_records    = records
+        existing_embs  = None
+        existing_ids, existing_names, existing_descs = [], [], []
+
+    new_embeddings, new_ids, new_names, new_descs = [], [], [], []
+    for i, r in enumerate(new_records):
+        progress_bar.progress(
+            (i + 1) / len(new_records),
+            text=f"Indexing website photo {i+1}/{len(new_records)}: {r['title'][:40]}"
+        )
+        try:
+            raw = fetch_url_image_bytes(r["image_url"])
+            pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            with torch.no_grad():
+                tensor = preprocess(pil).unsqueeze(0).to(device)
+                feat = model.encode_image(tensor)
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+            new_embeddings.append(feat.cpu().numpy().astype("float32")[0])
+            new_ids.append(r["image_url"])
+            new_names.append(r["title"])
+            new_descs.append(r["description"])
+        except Exception as e:
+            st.warning(f"Skipped website photo ({r['title'][:30]}): {e}")
+
+    if not new_embeddings:
+        return existing_index
+
+    new_emb_arr = np.stack(new_embeddings)
+
+    if existing_embs is not None and len(existing_embs) > 0:
+        merged_embs  = np.concatenate([existing_embs, new_emb_arr], axis=0)
+        merged_ids   = existing_ids   + new_ids
+        merged_names = existing_names + new_names
+        merged_descs = existing_descs + new_descs
+    else:
+        merged_embs  = new_emb_arr
+        merged_ids   = new_ids
+        merged_names = new_names
+        merged_descs = new_descs
+
+    return {
+        "embeddings":   merged_embs,
+        "ids":          merged_ids,
+        "names":        merged_names,
+        "descriptions": merged_descs,
+    }
+
+
+def _keyword_overlap(query_text: str, description: str) -> float:
+    """Fraction of query words that appear literally in the description."""
+    q_words = set(re.findall(r"[a-z0-9]+", query_text.lower()))
+    if not q_words:
+        return 0.0
+    d_words = set(re.findall(r"[a-z0-9]+", description.lower()))
+    return len(q_words & d_words) / len(q_words)
+
+
+def hybrid_search(drive_index, website_index, query_vec: np.ndarray,
+                   query_text: str, top_k: int) -> list[dict]:
+    """
+    Merge Drive-only results (pure CLIP similarity) with website results
+    (CLIP similarity boosted by literal keyword overlap against the human-
+    written description) into one ranked list.
+    """
+    results = []
+
+    if drive_index is not None and len(drive_index["ids"]) > 0:
+        sims = drive_index["embeddings"] @ query_vec
+        for i in range(len(drive_index["ids"])):
+            results.append({
+                "source": "drive",
+                "id":     drive_index["ids"][i],
+                "name":   drive_index["names"][i],
+                "score":  float(sims[i]),
+            })
+
+    if website_index is not None and len(website_index["ids"]) > 0:
+        sims = website_index["embeddings"] @ query_vec
+        for i in range(len(website_index["ids"])):
+            clip_score = float(sims[i])
+            kw = _keyword_overlap(query_text, website_index["descriptions"][i]) if query_text else 0.0
+            # Multiplicative boost: exact material/gem/style matches in the
+            # description float clearly relevant pieces to the top without
+            # letting keyword-only matches drown out visual similarity entirely.
+            final_score = clip_score * (1 + 0.6 * kw)
+            results.append({
+                "source": "web",
+                "id":     website_index["ids"][i],
+                "name":   website_index["names"][i],
+                "score":  final_score,
+            })
+
+    results.sort(key=lambda r: -r["score"])
+    return results[:top_k]
+
+
 # ── Sidebar: config ───────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### Settings")
@@ -448,6 +629,19 @@ with st.sidebar:
                              use_container_width=True,
                              help="Reprocesses all photos from scratch. "
                                   "Use if search results seem wrong or stale.")
+
+    st.markdown("---")
+    st.markdown("### Website photos")
+    st.caption(
+        "Improves matching for word searches by pairing each website product "
+        "photo with its real description. Downloads images from "
+        "serpentinejewels.com — no Drive changes needed."
+    )
+    web_update_btn  = st.button("Update website index", type="primary",
+                                 use_container_width=True, key="web_update_btn")
+    web_rebuild_btn = st.button("Full website rebuild", type="secondary",
+                                 use_container_width=True, key="web_rebuild_btn",
+                                 help="Reprocesses all website photos from scratch.")
 
     st.markdown("---")
     st.markdown("### Search tips")
@@ -509,9 +703,44 @@ if index is None:
     )
     st.stop()
 
+# ── Handle website index build / update ───────────────────────────────────────
+if web_update_btn or web_rebuild_btn:
+    existing_web = None
+    if web_update_btn:
+        existing_web = st.session_state.get("website_index") or load_website_index(service, folder_id)
+        label = "Checking for new website photos…"
+    else:
+        label = "Rebuilding website index from scratch — this downloads every product photo…"
+
+    with st.spinner(label):
+        bar = st.progress(0)
+        web_idx = build_website_index(bar, existing_index=existing_web)
+        if web_idx is not None:
+            save_website_index(service, folder_id, web_idx)
+            st.session_state["website_index"] = web_idx
+
+    if web_idx is not None:
+        added = len(web_idx["ids"]) - (len(existing_web["ids"]) if existing_web else 0)
+        if web_update_btn and added == 0:
+            st.success(f"Website index already up to date — {len(web_idx['ids'])} photos indexed.")
+        elif web_update_btn:
+            st.success(f"Added {added} new website photo(s). Now covers {len(web_idx['ids'])} photos.")
+        else:
+            st.success(f"Website rebuild complete — {len(web_idx['ids'])} photos indexed.")
+
+# Load website index (from session or Drive) — optional, search still works without it
+if "website_index" not in st.session_state:
+    with st.spinner("Loading website index…"):
+        web_idx = load_website_index(service, folder_id)
+        if web_idx:
+            st.session_state["website_index"] = web_idx
+
+website_index = st.session_state.get("website_index")
+
 from datetime import datetime
 _now = datetime.now().strftime("%b %d, %H:%M")
-st.caption(f"Index contains **{len(index['ids'])} photos** · last loaded {_now}")
+_web_note = f" · {len(website_index['ids'])} website photos" if website_index else ""
+st.caption(f"Index contains **{len(index['ids'])} photos**{_web_note} · last loaded {_now}")
 
 # ── Search UI ─────────────────────────────────────────────────────────────────
 col_text, col_upload = st.columns([3, 1])
@@ -537,25 +766,29 @@ if query_file:
     st.image(pil_img, caption="Reference photo", width=200)
     with st.spinner("Finding similar pieces…"):
         qvec = embed_image(pil_img)
-    results = search(index, qvec, top_k)
+    results = hybrid_search(index, website_index, qvec, "", top_k)
     search_label = "Visually similar to your photo"
 
 elif query_text.strip():
     with st.spinner("Searching…"):
         qvec = embed_text(query_text.strip())
-    results = search(index, qvec, top_k)
+    results = hybrid_search(index, website_index, qvec, query_text.strip(), top_k)
     search_label = f"Results for **{query_text.strip()}**"
 
 # ── Display results ───────────────────────────────────────────────────────────
 if results:
     st.markdown(f"#### {search_label}")
     cols = st.columns(5)
-    for rank, (fid, name, score) in enumerate(results):
+    for rank, r in enumerate(results):
         col = cols[rank % 5]
         with col:
             raw = None
+            name = r["name"]
             try:
-                raw = fetch_image_bytes(service, fid)
+                if r["source"] == "drive":
+                    raw = fetch_image_bytes(service, r["id"])
+                else:
+                    raw = fetch_url_image_bytes(r["id"])
                 pil = Image.open(io.BytesIO(raw)).convert("RGB")
                 # Cap *display* size only — `raw` above is untouched, full quality
                 display_pil = pil.copy()
@@ -564,16 +797,24 @@ if results:
             except Exception:
                 st.markdown("_(preview unavailable)_")
             st.caption(f"{name[:28]}{'…' if len(name)>28 else ''}")
-            st.caption(f"Match: {score:.0%}")
+            st.caption(f"Match: {r['score']:.0%}")
+            if r["source"] == "web":
+                st.caption("🌐 website photo")
             if raw is not None:
-                ext = os.path.splitext(name)[1].lower().lstrip(".") or "jpg"
+                if r["source"] == "drive":
+                    file_name = name
+                else:
+                    ext = os.path.splitext(r["id"].split("?")[0])[1].lstrip(".") or "jpg"
+                    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", name)[:40]
+                    file_name = f"{safe_name}.{ext}"
+                ext = os.path.splitext(file_name)[1].lower().lstrip(".") or "jpg"
                 mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
                 st.download_button(
                     "Download",
                     data=raw,
-                    file_name=name,
+                    file_name=file_name,
                     mime=mime,
-                    key=f"dl_{fid}",
+                    key=f"dl_{r['source']}_{rank}",
                     use_container_width=True,
                 )
 
