@@ -14,7 +14,10 @@ Deploy to Streamlit Cloud:
 import io
 import os
 import re
+import ssl
+import time
 import json
+import random
 import base64
 import tempfile
 
@@ -202,6 +205,37 @@ def embed_image(pil_img: Image.Image):
 
 
 # ── Helpers: Google Drive ─────────────────────────────────────────────────────
+def _execute_with_retry(request, max_retries: int = 4, base_delay: float = 1.0):
+    """
+    Run a Google API request's .execute(), retrying transient network
+    failures (dropped SSL connections, read timeouts, 5xx/429 responses)
+    with exponential backoff + jitter.
+
+    Streamlit Cloud's outbound connections to Google occasionally get reset
+    mid-request (raw ssl.SSLError / socket errors bubbling up through
+    httplib2). Without retrying, a single blip crashes the whole app since
+    these calls happen at page-load time, not just on user actions.
+    """
+    from googleapiclient.errors import HttpError
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status not in (429, 500, 502, 503, 504):
+                raise
+            last_err = e
+        except (ssl.SSLError, ConnectionError, TimeoutError, OSError) as e:
+            last_err = e
+
+        if attempt < max_retries - 1:
+            time.sleep(base_delay * (2 ** attempt) + random.uniform(0, 0.5))
+
+    raise last_err
+
+
 @st.cache_resource(show_spinner="Connecting to Google Drive…")
 def get_drive_service():
     """
@@ -254,11 +288,11 @@ def list_drive_images(service, folder_id: str) -> list[dict]:
         q = f"'{fid}' in parents and trashed = false"
         pt = None
         while True:
-            resp = service.files().list(
+            resp = _execute_with_retry(service.files().list(
                 q=q,
                 fields="nextPageToken, files(id, name, mimeType, thumbnailLink, webContentLink)",
                 pageSize=1000, pageToken=pt,
-            ).execute()
+            ))
             for item in resp.get("files", []):
                 if item["mimeType"] == "application/vnd.google-apps.folder":
                     if item["id"] not in seen:
@@ -288,10 +322,10 @@ def fetch_image_bytes(service, file_id: str) -> bytes:
 # ── Index management ──────────────────────────────────────────────────────────
 def _find_file_by_name(service, folder_id: str, name: str):
     """Return the Drive file ID of a file with the given name in this folder, if any."""
-    resp = service.files().list(
+    resp = _execute_with_retry(service.files().list(
         q=f"'{folder_id}' in parents and name='{name}' and trashed=false",
         fields="files(id, name)",
-    ).execute()
+    ))
     files = resp.get("files", [])
     return files[0]["id"] if files else None
 
@@ -328,10 +362,10 @@ def save_index(service, folder_id: str, index: dict):
 
     existing_id = find_index_file(service, folder_id)
     if existing_id:
-        service.files().update(fileId=existing_id, media_body=media).execute()
+        _execute_with_retry(service.files().update(fileId=existing_id, media_body=media))
     else:
         meta = {"name": INDEX_FILENAME, "parents": [folder_id]}
-        service.files().create(body=meta, media_body=media).execute()
+        _execute_with_retry(service.files().create(body=meta, media_body=media))
 
 
 def build_index(service, folder_id: str, progress_bar, existing_index=None):
@@ -476,10 +510,10 @@ def save_website_index(service, folder_id: str, index: dict):
 
     existing_id = _find_file_by_name(service, folder_id, WEBSITE_INDEX_FILENAME)
     if existing_id:
-        service.files().update(fileId=existing_id, media_body=media).execute()
+        _execute_with_retry(service.files().update(fileId=existing_id, media_body=media))
     else:
         meta = {"name": WEBSITE_INDEX_FILENAME, "parents": [folder_id]}
-        service.files().create(body=meta, media_body=media).execute()
+        _execute_with_retry(service.files().create(body=meta, media_body=media))
 
 
 def build_website_index(progress_bar, existing_index=None):
@@ -691,7 +725,14 @@ if update_btn or rebuild_btn:
 # Load index (from session or Drive)
 if "index" not in st.session_state:
     with st.spinner("Loading index from Drive…"):
-        idx = load_index(service, folder_id)
+        try:
+            idx = load_index(service, folder_id)
+        except Exception as e:
+            st.error(
+                f"Couldn't reach Google Drive to load the index ({e}). "
+                "This is usually a transient network issue — try reloading the page."
+            )
+            st.stop()
         if idx:
             st.session_state["index"] = idx
 
@@ -731,7 +772,11 @@ if web_update_btn or web_rebuild_btn:
 # Load website index (from session or Drive) — optional, search still works without it
 if "website_index" not in st.session_state:
     with st.spinner("Loading website index…"):
-        web_idx = load_website_index(service, folder_id)
+        try:
+            web_idx = load_website_index(service, folder_id)
+        except Exception as e:
+            web_idx = None
+            st.caption(f"⚠️ Couldn't load the website index ({e}) — continuing without it.")
         if web_idx:
             st.session_state["website_index"] = web_idx
 
