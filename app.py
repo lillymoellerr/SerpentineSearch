@@ -55,9 +55,14 @@ DRIVE_FOLDER_KEY = "drive_folder_id"   # stored in st.session_state / secrets
 TOP_K_DEFAULT    = 20
 
 # Background-removal / object-isolation settings (see isolate_jewelry() below).
-REMBG_MODEL      = "isnet-general-use"  # good accuracy/speed balance for product photos
+# u2netp is the lightweight rembg model (~4MB vs. ~176MB for isnet-general-use) —
+# noticeably faster per-image, which matters once you're indexing thousands
+# of photos. Masks are slightly less precise but plenty good for jewelry shot
+# against a clean-ish backdrop.
+REMBG_MODEL      = "u2netp"
 ISOLATE_PADDING  = 0.08                 # fraction of bbox size added as margin on each side
 ISOLATE_BG_COLOR = (128, 128, 128)      # neutral backdrop the cutout is composited onto
+CHECKPOINT_EVERY = 200                  # save partial progress to Drive every N new photos
 
 # ── CSS — Serpentine brand palette ───────────────────────────────────────────
 EMERALD = "#002F1E"
@@ -177,13 +182,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Background-removal availability check ────────────────────────────────────
-try:
-    import rembg  # noqa: F401
-    REMBG_AVAILABLE = True
-except ImportError:
-    REMBG_AVAILABLE = False
-
 # ── Helpers: CLIP model ───────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading AI model (first run only)…")
 def load_clip():
@@ -231,9 +229,12 @@ def isolate_jewelry(pil_img: Image.Image) -> Image.Image:
     embedding forces the match to be about the jewelry, so a worn/lifestyle
     photo of the same piece can rank above a different piece shot on white.
 
-    Degrades gracefully to the original photo (no isolation) if `rembg`
-    isn't installed or fails on a given image — indexing/search still work,
-    just without the object-isolation improvement.
+    Everything rembg-related is imported lazily, right here, inside this
+    try/except — never at module scope. rembg pulls in numba, which does
+    native LLVM/JIT setup as a side effect of import; on some environments
+    that can fail in ways a plain ImportError check won't catch. Keeping the
+    import local means a failure here only degrades this one photo (falls
+    back to the un-isolated image), and can never break the rest of the app.
     """
     try:
         from rembg import remove
@@ -439,6 +440,21 @@ def save_index(service, folder_id: str, index: dict):
         _execute_with_retry(service.files().create(body=meta, media_body=media))
 
 
+def _merge_index(existing_embs, existing_ids, existing_names,
+                  new_embeddings, new_ids, new_names) -> dict:
+    """Stack new photo embeddings onto whatever was already indexed."""
+    new_emb_arr = np.stack(new_embeddings)
+    if existing_embs is not None and len(existing_embs) > 0:
+        merged_embs  = np.concatenate([existing_embs, new_emb_arr], axis=0)
+        merged_ids   = list(existing_ids)   + list(new_ids)
+        merged_names = list(existing_names) + list(new_names)
+    else:
+        merged_embs  = new_emb_arr
+        merged_ids   = list(new_ids)
+        merged_names = list(new_names)
+    return {"embeddings": merged_embs, "ids": merged_ids, "names": merged_names}
+
+
 def build_index(service, folder_id: str, progress_bar, existing_index=None):
     """
     Build or incrementally update the CLIP index.
@@ -487,6 +503,12 @@ def build_index(service, folder_id: str, progress_bar, existing_index=None):
         existing_names = []
 
     # ── Embed only the new files ──────────────────────────────────────────────
+    # Checkpointing: on a large first-time index (thousands of photos going
+    # through background removal), a single run can take a long time. If the
+    # process gets killed/restarted partway through, we don't want to lose
+    # everything — so every CHECKPOINT_EVERY photos we save what we have so
+    # far back to Drive. A later "Update (new photos only)" run then only
+    # has to redo whatever wasn't checkpointed yet.
     new_embeddings, new_ids, new_names = [], [], []
     for i, f in enumerate(new_files):
         progress_bar.progress(
@@ -507,27 +529,21 @@ def build_index(service, folder_id: str, progress_bar, existing_index=None):
         except Exception as e:
             st.warning(f"Skipped {f['name']}: {e}")
 
+        if new_embeddings and (len(new_embeddings) % CHECKPOINT_EVERY == 0):
+            partial = _merge_index(existing_embs, existing_ids, existing_names,
+                                    new_embeddings, new_ids, new_names)
+            try:
+                save_index(service, folder_id, partial)
+                st.caption(f"💾 Checkpoint saved — {len(partial['ids'])} photos indexed so far.")
+            except Exception as e:
+                st.caption(f"⚠️ Checkpoint save failed ({e}) — continuing anyway.")
+
     if not new_embeddings:
         # All new files errored out — return existing unchanged
         return existing_index
 
-    new_emb_arr = np.stack(new_embeddings)
-
-    # ── Merge new with existing ───────────────────────────────────────────────
-    if existing_embs is not None and len(existing_embs) > 0:
-        merged_embs  = np.concatenate([existing_embs, new_emb_arr], axis=0)
-        merged_ids   = existing_ids   + new_ids
-        merged_names = existing_names + new_names
-    else:
-        merged_embs  = new_emb_arr
-        merged_ids   = new_ids
-        merged_names = new_names
-
-    return {
-        "embeddings": merged_embs,
-        "ids":        merged_ids,
-        "names":      merged_names,
-    }
+    return _merge_index(existing_embs, existing_ids, existing_names,
+                         new_embeddings, new_ids, new_names)
 
 
 def search(index: dict, query_vec: np.ndarray, top_k: int) -> list[tuple]:
@@ -588,7 +604,25 @@ def save_website_index(service, folder_id: str, index: dict):
         _execute_with_retry(service.files().create(body=meta, media_body=media))
 
 
-def build_website_index(progress_bar, existing_index=None):
+def _merge_website_index(existing_embs, existing_ids, existing_names, existing_descs,
+                          new_embeddings, new_ids, new_names, new_descs) -> dict:
+    """Stack new website-photo embeddings onto whatever was already indexed."""
+    new_emb_arr = np.stack(new_embeddings)
+    if existing_embs is not None and len(existing_embs) > 0:
+        merged_embs  = np.concatenate([existing_embs, new_emb_arr], axis=0)
+        merged_ids   = list(existing_ids)   + list(new_ids)
+        merged_names = list(existing_names) + list(new_names)
+        merged_descs = list(existing_descs) + list(new_descs)
+    else:
+        merged_embs  = new_emb_arr
+        merged_ids   = list(new_ids)
+        merged_names = list(new_names)
+        merged_descs = list(new_descs)
+    return {"embeddings": merged_embs, "ids": merged_ids,
+            "names": merged_names, "descriptions": merged_descs}
+
+
+def build_website_index(service, folder_id: str, progress_bar, existing_index=None):
     """
     Build or incrementally update the website CLIP+description index.
     Images are downloaded straight from Shopify's CDN (image_url), embedded
@@ -638,28 +672,20 @@ def build_website_index(progress_bar, existing_index=None):
         except Exception as e:
             st.warning(f"Skipped website photo ({r['title'][:30]}): {e}")
 
+        if new_embeddings and (len(new_embeddings) % CHECKPOINT_EVERY == 0):
+            partial = _merge_website_index(existing_embs, existing_ids, existing_names, existing_descs,
+                                            new_embeddings, new_ids, new_names, new_descs)
+            try:
+                save_website_index(service, folder_id, partial)
+                st.caption(f"💾 Checkpoint saved — {len(partial['ids'])} website photos indexed so far.")
+            except Exception as e:
+                st.caption(f"⚠️ Checkpoint save failed ({e}) — continuing anyway.")
+
     if not new_embeddings:
         return existing_index
 
-    new_emb_arr = np.stack(new_embeddings)
-
-    if existing_embs is not None and len(existing_embs) > 0:
-        merged_embs  = np.concatenate([existing_embs, new_emb_arr], axis=0)
-        merged_ids   = existing_ids   + new_ids
-        merged_names = existing_names + new_names
-        merged_descs = existing_descs + new_descs
-    else:
-        merged_embs  = new_emb_arr
-        merged_ids   = new_ids
-        merged_names = new_names
-        merged_descs = new_descs
-
-    return {
-        "embeddings":   merged_embs,
-        "ids":          merged_ids,
-        "names":        merged_names,
-        "descriptions": merged_descs,
-    }
+    return _merge_website_index(existing_embs, existing_ids, existing_names, existing_descs,
+                                 new_embeddings, new_ids, new_names, new_descs)
 
 
 def _keyword_overlap(query_text: str, description: str) -> float:
@@ -730,14 +756,6 @@ with st.sidebar:
         "The index lets search run instantly. **Update** adds only new photos "
         "(seconds). **Full Rebuild** reprocesses everything (minutes)."
     )
-    if not REMBG_AVAILABLE:
-        st.warning(
-            "⚠️ `rembg` isn't installed — matching is using raw photos "
-            "(no background removal), so results will lean toward photos "
-            "with similar backgrounds rather than the same item. Push the "
-            "updated requirements.txt and reboot the app to fix this.",
-            icon="⚠️",
-        )
     update_btn  = st.button("Update (new photos only)", type="primary",
                              use_container_width=True)
     rebuild_btn = st.button("Full Rebuild", type="secondary",
@@ -836,7 +854,7 @@ if web_update_btn or web_rebuild_btn:
 
     with st.spinner(label):
         bar = st.progress(0)
-        web_idx = build_website_index(bar, existing_index=existing_web)
+        web_idx = build_website_index(service, folder_id, bar, existing_index=existing_web)
         if web_idx is not None:
             save_website_index(service, folder_id, web_idx)
             st.session_state["website_index"] = web_idx
