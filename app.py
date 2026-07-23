@@ -54,12 +54,8 @@ PRETRAINED       = "laion2b_s34b_b79k"
 DRIVE_FOLDER_KEY = "drive_folder_id"   # stored in st.session_state / secrets
 TOP_K_DEFAULT    = 20
 
-# Background-removal / object-isolation settings (see isolate_jewelry() below).
-# u2netp is the lightweight rembg model (~4MB vs. ~176MB for isnet-general-use) —
-# noticeably faster per-image, which matters once you're indexing thousands
-# of photos. Masks are slightly less precise but plenty good for jewelry shot
-# against a clean-ish backdrop.
-REMBG_MODEL      = "u2netp"
+# Object-isolation settings (see isolate_jewelry() below) — pure PIL/numpy,
+# no ML model or extra dependency involved.
 ISOLATE_PADDING  = 0.08                 # fraction of bbox size added as margin on each side
 ISOLATE_BG_COLOR = (128, 128, 128)      # neutral backdrop the cutout is composited onto
 CHECKPOINT_EVERY = 200                  # save partial progress to Drive every N new photos
@@ -210,41 +206,47 @@ def embed_text(query: str):
     return feat.cpu().numpy().astype("float32")[0]
 
 
-@st.cache_resource(show_spinner="Loading background-removal model (first run only)…")
-def load_bg_remover():
-    from rembg import new_session
-    return new_session(REMBG_MODEL)
-
-
 def isolate_jewelry(pil_img: Image.Image) -> Image.Image:
     """
-    Cut the jewelry piece out of its background and re-composite it onto a
-    fixed neutral backdrop, cropped tight to the item.
+    Crop tight to the jewelry and neutralize the backdrop, using a simple
+    corner/border-color heuristic — no ML model, no extra dependencies, no
+    network call. (We tried rembg/numba for true segmentation first; it
+    proved too fragile in this hosting environment — blank app, native
+    crash, and a silent hang across three separate deploys. This approach
+    uses only PIL/numpy, which are already solid here, so it structurally
+    cannot hang or crash the way that did.)
 
-    Why: raw CLIP embeddings of full photos capture photography style —
-    white seamless paper, studio lighting, framing — as strongly as the
-    object itself. That makes a studio product shot match other studio
-    product shots first, regardless of whether it's actually the same
-    piece. Stripping the background and normalizing the backdrop before
-    embedding forces the match to be about the jewelry, so a worn/lifestyle
-    photo of the same piece can rank above a different piece shot on white.
-
-    Everything rembg-related is imported lazily, right here, inside this
-    try/except — never at module scope. rembg pulls in numba, which does
-    native LLVM/JIT setup as a side effect of import; on some environments
-    that can fail in ways a plain ImportError check won't catch. Keeping the
-    import local means a failure here only degrades this one photo (falls
-    back to the un-isolated image), and can never break the rest of the app.
+    Why bother at all: raw CLIP embeddings of full photos capture
+    photography style — white seamless paper, studio lighting, framing —
+    as strongly as the object itself. That makes a studio product shot
+    match other studio product shots first, regardless of whether it's
+    actually the same piece. Cropping out the dead background space and
+    flattening what's left toward a neutral color reduces how much "white
+    studio backdrop" dominates the embedding versus the jewelry itself.
     """
     try:
-        from rembg import remove
-        session = load_bg_remover()
-        cutout = remove(pil_img, session=session)  # RGBA, background made transparent
+        arr = np.asarray(pil_img.convert("RGB")).astype(np.int16)
+        h, w = arr.shape[:2]
 
-        alpha = np.array(cutout.split()[-1])
-        ys, xs = np.where(alpha > 10)
+        # Estimate the background color from a thin strip around all four
+        # edges (median, so a single stray reflection/shadow in one corner
+        # doesn't skew it).
+        border = max(4, min(h, w) // 50)
+        border_px = np.concatenate([
+            arr[:border, :, :].reshape(-1, 3),
+            arr[-border:, :, :].reshape(-1, 3),
+            arr[:, :border, :].reshape(-1, 3),
+            arr[:, -border:, :].reshape(-1, 3),
+        ])
+        bg_color = np.median(border_px, axis=0)
+
+        dist = np.sqrt(((arr - bg_color) ** 2).sum(axis=-1))
+        threshold = 28  # empirically reasonable for clean studio backgrounds
+        mask = dist > threshold
+
+        ys, xs = np.where(mask)
         if len(xs) == 0 or len(ys) == 0:
-            # Nothing detected as foreground — fall back to the original photo
+            # Nothing detected as different from the background — leave as-is
             # rather than risk cropping to an empty/garbage region.
             return pil_img
 
@@ -252,16 +254,16 @@ def isolate_jewelry(pil_img: Image.Image) -> Image.Image:
         y0, y1 = ys.min(), ys.max()
         pad_x = int((x1 - x0) * ISOLATE_PADDING) + 1
         pad_y = int((y1 - y0) * ISOLATE_PADDING) + 1
-        x0 = max(0, x0 - pad_x); x1 = min(cutout.width,  x1 + pad_x)
-        y0 = max(0, y0 - pad_y); y1 = min(cutout.height, y1 + pad_y)
+        x0 = max(0, x0 - pad_x); x1 = min(w, x1 + pad_x)
+        y0 = max(0, y0 - pad_y); y1 = min(h, y1 + pad_y)
 
-        cropped = cutout.crop((x0, y0, x1, y1))
-        backdrop = Image.new("RGB", cropped.size, ISOLATE_BG_COLOR)
-        backdrop.paste(cropped, mask=cropped.split()[-1])
-        return backdrop
+        cropped = arr[y0:y1, x0:x1].copy()
+        crop_mask = mask[y0:y1, x0:x1]
+        # Flatten background-ish pixels toward the neutral backdrop color so
+        # residual white/off-white framing doesn't dominate the embedding.
+        cropped[~crop_mask] = ISOLATE_BG_COLOR
+        return Image.fromarray(np.clip(cropped, 0, 255).astype("uint8"), "RGB")
     except Exception:
-        # rembg unavailable / failed on this image — degrade to raw photo
-        # rather than breaking indexing or search.
         return pil_img
 
 
