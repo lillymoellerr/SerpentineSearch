@@ -177,6 +177,13 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# ── Background-removal availability check ────────────────────────────────────
+try:
+    import rembg  # noqa: F401
+    REMBG_AVAILABLE = True
+except ImportError:
+    REMBG_AVAILABLE = False
+
 # ── Helpers: CLIP model ───────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading AI model (first run only)…")
 def load_clip():
@@ -223,10 +230,13 @@ def isolate_jewelry(pil_img: Image.Image) -> Image.Image:
     piece. Stripping the background and normalizing the backdrop before
     embedding forces the match to be about the jewelry, so a worn/lifestyle
     photo of the same piece can rank above a different piece shot on white.
-    """
-    from rembg import remove
 
+    Degrades gracefully to the original photo (no isolation) if `rembg`
+    isn't installed or fails on a given image — indexing/search still work,
+    just without the object-isolation improvement.
+    """
     try:
+        from rembg import remove
         session = load_bg_remover()
         cutout = remove(pil_img, session=session)  # RGBA, background made transparent
 
@@ -720,6 +730,14 @@ with st.sidebar:
         "The index lets search run instantly. **Update** adds only new photos "
         "(seconds). **Full Rebuild** reprocesses everything (minutes)."
     )
+    if not REMBG_AVAILABLE:
+        st.warning(
+            "⚠️ `rembg` isn't installed — matching is using raw photos "
+            "(no background removal), so results will lean toward photos "
+            "with similar backgrounds rather than the same item. Push the "
+            "updated requirements.txt and reboot the app to fix this.",
+            icon="⚠️",
+        )
     update_btn  = st.button("Update (new photos only)", type="primary",
                              use_container_width=True)
     rebuild_btn = st.button("Full Rebuild", type="secondary",
