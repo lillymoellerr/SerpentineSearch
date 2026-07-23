@@ -42,12 +42,17 @@ st.set_page_config(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-# NOTE: index filenames bumped to "_v2" because the embedding pipeline changed
-# (object-isolation added below) — v1 files hold embeddings of whole photos
-# including background, which are not comparable to v2 embeddings. Bumping the
-# name forces a fresh Full Rebuild instead of silently mixing the two spaces.
-INDEX_FILENAME         = "serpentine_photo_index_v2.npz"
-WEBSITE_INDEX_FILENAME = "serpentine_website_index_v2.npz"
+# NOTE: kept on the ORIGINAL filenames (not "_v2") on purpose. The service
+# account this app runs as has zero Drive storage quota of its own, so it can
+# only ever *update* a file that already exists — never create a new one (see
+# save_index). These original files already exist and are already shared with
+# the service account, so reusing the name lets updates go through. Full
+# Rebuild always reprocesses every photo from scratch regardless of filename,
+# so overwriting these with the new (object-isolated) embeddings is safe —
+# just make sure you run Full Rebuild (not Update) once after this change so
+# old and new embeddings don't end up mixed in the same file.
+INDEX_FILENAME         = "serpentine_photo_index.npz"
+WEBSITE_INDEX_FILENAME = "serpentine_website_index.npz"
 PRODUCT_DATA_FILENAME  = "serpentine_product_data.json"
 MODEL_NAME       = "ViT-B-32"
 PRETRAINED       = "laion2b_s34b_b79k"
@@ -812,8 +817,18 @@ if update_btn or rebuild_btn:
     with st.spinner(label):
         bar = st.progress(0)
         idx = build_index(service, folder_id, bar, existing_index=existing)
-        save_index(service, folder_id, idx)
+        # Keep the freshly built index usable for this session regardless of
+        # whether saving to Drive succeeds — a save failure here should never
+        # throw away work that already finished.
         st.session_state["index"] = idx
+        try:
+            save_index(service, folder_id, idx)
+        except Exception as e:
+            st.error(
+                f"Built the index ({len(idx['ids'])} photos) but couldn't save it "
+                f"to Drive: {e}. Search will still work for this session, but the "
+                f"index won't persist after a reboot until this is fixed."
+            )
 
     added = len(idx["ids"]) - (len(existing["ids"]) if existing else 0)
     if update_btn and added == 0:
@@ -858,8 +873,15 @@ if web_update_btn or web_rebuild_btn:
         bar = st.progress(0)
         web_idx = build_website_index(service, folder_id, bar, existing_index=existing_web)
         if web_idx is not None:
-            save_website_index(service, folder_id, web_idx)
             st.session_state["website_index"] = web_idx
+            try:
+                save_website_index(service, folder_id, web_idx)
+            except Exception as e:
+                st.error(
+                    f"Built the website index ({len(web_idx['ids'])} photos) but couldn't "
+                    f"save it to Drive: {e}. Search will still work for this session, but "
+                    f"the index won't persist after a reboot until this is fixed."
+                )
 
     if web_idx is not None:
         added = len(web_idx["ids"]) - (len(existing_web["ids"]) if existing_web else 0)
