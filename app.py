@@ -42,13 +42,22 @@ st.set_page_config(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-INDEX_FILENAME         = "serpentine_photo_index.npz"
-WEBSITE_INDEX_FILENAME = "serpentine_website_index.npz"
+# NOTE: index filenames bumped to "_v2" because the embedding pipeline changed
+# (object-isolation added below) — v1 files hold embeddings of whole photos
+# including background, which are not comparable to v2 embeddings. Bumping the
+# name forces a fresh Full Rebuild instead of silently mixing the two spaces.
+INDEX_FILENAME         = "serpentine_photo_index_v2.npz"
+WEBSITE_INDEX_FILENAME = "serpentine_website_index_v2.npz"
 PRODUCT_DATA_FILENAME  = "serpentine_product_data.json"
 MODEL_NAME       = "ViT-B-32"
 PRETRAINED       = "laion2b_s34b_b79k"
 DRIVE_FOLDER_KEY = "drive_folder_id"   # stored in st.session_state / secrets
 TOP_K_DEFAULT    = 20
+
+# Background-removal / object-isolation settings (see isolate_jewelry() below).
+REMBG_MODEL      = "isnet-general-use"  # good accuracy/speed balance for product photos
+ISOLATE_PADDING  = 0.08                 # fraction of bbox size added as margin on each side
+ISOLATE_BG_COLOR = (128, 128, 128)      # neutral backdrop the cutout is composited onto
 
 # ── CSS — Serpentine brand palette ───────────────────────────────────────────
 EMERALD = "#002F1E"
@@ -196,11 +205,61 @@ def embed_text(query: str):
     return feat.cpu().numpy().astype("float32")[0]
 
 
+@st.cache_resource(show_spinner="Loading background-removal model (first run only)…")
+def load_bg_remover():
+    from rembg import new_session
+    return new_session(REMBG_MODEL)
+
+
+def isolate_jewelry(pil_img: Image.Image) -> Image.Image:
+    """
+    Cut the jewelry piece out of its background and re-composite it onto a
+    fixed neutral backdrop, cropped tight to the item.
+
+    Why: raw CLIP embeddings of full photos capture photography style —
+    white seamless paper, studio lighting, framing — as strongly as the
+    object itself. That makes a studio product shot match other studio
+    product shots first, regardless of whether it's actually the same
+    piece. Stripping the background and normalizing the backdrop before
+    embedding forces the match to be about the jewelry, so a worn/lifestyle
+    photo of the same piece can rank above a different piece shot on white.
+    """
+    from rembg import remove
+
+    try:
+        session = load_bg_remover()
+        cutout = remove(pil_img, session=session)  # RGBA, background made transparent
+
+        alpha = np.array(cutout.split()[-1])
+        ys, xs = np.where(alpha > 10)
+        if len(xs) == 0 or len(ys) == 0:
+            # Nothing detected as foreground — fall back to the original photo
+            # rather than risk cropping to an empty/garbage region.
+            return pil_img
+
+        x0, x1 = xs.min(), xs.max()
+        y0, y1 = ys.min(), ys.max()
+        pad_x = int((x1 - x0) * ISOLATE_PADDING) + 1
+        pad_y = int((y1 - y0) * ISOLATE_PADDING) + 1
+        x0 = max(0, x0 - pad_x); x1 = min(cutout.width,  x1 + pad_x)
+        y0 = max(0, y0 - pad_y); y1 = min(cutout.height, y1 + pad_y)
+
+        cropped = cutout.crop((x0, y0, x1, y1))
+        backdrop = Image.new("RGB", cropped.size, ISOLATE_BG_COLOR)
+        backdrop.paste(cropped, mask=cropped.split()[-1])
+        return backdrop
+    except Exception:
+        # rembg unavailable / failed on this image — degrade to raw photo
+        # rather than breaking indexing or search.
+        return pil_img
+
+
 def embed_image(pil_img: Image.Image):
     import torch
     model, preprocess, _, device = load_clip()
+    isolated = isolate_jewelry(pil_img)
     with torch.no_grad():
-        tensor = preprocess(pil_img).unsqueeze(0).to(device)
+        tensor = preprocess(isolated).unsqueeze(0).to(device)
         feat = model.encode_image(tensor)
         feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat.cpu().numpy().astype("float32")[0]
@@ -427,8 +486,9 @@ def build_index(service, folder_id: str, progress_bar, existing_index=None):
         try:
             raw = fetch_image_bytes(service, f["id"])
             pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            isolated = isolate_jewelry(pil)
             with torch.no_grad():
-                tensor = preprocess(pil).unsqueeze(0).to(device)
+                tensor = preprocess(isolated).unsqueeze(0).to(device)
                 feat = model.encode_image(tensor)
                 feat = feat / feat.norm(dim=-1, keepdim=True)
             new_embeddings.append(feat.cpu().numpy().astype("float32")[0])
@@ -556,8 +616,9 @@ def build_website_index(progress_bar, existing_index=None):
         try:
             raw = fetch_url_image_bytes(r["image_url"])
             pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            isolated = isolate_jewelry(pil)
             with torch.no_grad():
-                tensor = preprocess(pil).unsqueeze(0).to(device)
+                tensor = preprocess(isolated).unsqueeze(0).to(device)
                 feat = model.encode_image(tensor)
                 feat = feat / feat.norm(dim=-1, keepdim=True)
             new_embeddings.append(feat.cpu().numpy().astype("float32")[0])
