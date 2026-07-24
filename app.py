@@ -63,7 +63,7 @@ TOP_K_DEFAULT    = 20
 # no ML model or extra dependency involved.
 ISOLATE_PADDING  = 0.08                 # fraction of bbox size added as margin on each side
 ISOLATE_BG_COLOR = (128, 128, 128)      # neutral backdrop the cutout is composited onto
-CHECKPOINT_EVERY = 200                  # save partial progress to Drive every N new photos
+CHECKPOINT_EVERY = 20                   # save partial progress to Drive every N new photos
 
 # ── CSS — Serpentine brand palette ───────────────────────────────────────────
 EMERALD = "#002F1E"
