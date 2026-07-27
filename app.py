@@ -14,11 +14,13 @@ Deploy to Streamlit Cloud:
 import io
 import os
 import re
+import gc
 import ssl
 import time
 import json
 import random
 import base64
+import ctypes
 import tempfile
 
 # Cap native BLAS/OpenMP thread pools before torch (imported lazily further
@@ -29,6 +31,23 @@ import tempfile
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def _release_memory():
+    """
+    Force freed memory back to the OS. Python's own garbage collector frees
+    objects but doesn't always return the underlying heap space to the OS,
+    and torch's CPU allocator can hold onto arenas indefinitely. On a long
+    indexing run (thousands of photos) this lets resident memory creep up
+    until the container's memory limit is hit, which has caused native
+    crashes late into a run rather than at startup. Called periodically
+    (every checkpoint) to keep memory usage flat over long runs.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # not on glibc (e.g. local macOS dev) — safe to skip
 
 import requests
 import numpy as np
@@ -554,6 +573,7 @@ def build_index(service, folder_id: str, progress_bar, existing_index=None):
                 st.caption(f"💾 Checkpoint saved — {len(partial['ids'])} photos indexed so far.")
             except Exception as e:
                 st.caption(f"⚠️ Checkpoint save failed ({e}) — continuing anyway.")
+            _release_memory()
 
     if not new_embeddings:
         # All new files errored out — return existing unchanged
@@ -697,6 +717,7 @@ def build_website_index(service, folder_id: str, progress_bar, existing_index=No
                 st.caption(f"💾 Checkpoint saved — {len(partial['ids'])} website photos indexed so far.")
             except Exception as e:
                 st.caption(f"⚠️ Checkpoint save failed ({e}) — continuing anyway.")
+            _release_memory()
 
     if not new_embeddings:
         return existing_index
