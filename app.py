@@ -21,6 +21,15 @@ import random
 import base64
 import tempfile
 
+# Cap native BLAS/OpenMP thread pools before torch (imported lazily further
+# down) can spin up more threads than this container's CPU quota allows. On
+# Streamlit Cloud's shared infrastructure, torch over-detects available
+# cores, and the resulting thread/memory overhead has caused native crashes
+# (segfaults, heap corruption) during model loading and inference.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import requests
 import numpy as np
 import streamlit as st
@@ -187,6 +196,7 @@ st.markdown(f"""
 @st.cache_resource(show_spinner="Loading AI model (first run only)…")
 def load_clip():
     import torch
+    torch.set_num_threads(1)
     import open_clip
     device = "mps" if hasattr(__import__("torch").backends, "mps") and \
               __import__("torch").backends.mps.is_available() else "cpu"
