@@ -840,12 +840,21 @@ with st.sidebar:
     st.markdown("### Index")
     st.caption(
         "The index lets search run instantly. **Update** adds only new photos "
-        "(seconds). **Full Rebuild** reprocesses everything (minutes)."
+        "(seconds). **Full Rebuild** reprocesses everything (hours to days "
+        "for a library this size)."
     )
     update_btn  = st.button("Update (new photos only)", type="primary",
                              use_container_width=True)
+    rebuild_confirm = st.checkbox(
+        "I understand — reprocesses every photo from scratch (takes "
+        "hours to days for a library this size), and closing the tab or "
+        "clicking again mid-run can lose progress.",
+        value=False,
+        key="rebuild_confirm",
+    )
     rebuild_btn = st.button("Full Rebuild", type="secondary",
                              use_container_width=True,
+                             disabled=not rebuild_confirm,
                              help="Reprocesses all photos from scratch. "
                                   "Use if search results seem wrong or stale.")
 
@@ -858,8 +867,14 @@ with st.sidebar:
     )
     web_update_btn  = st.button("Update website index", type="primary",
                                  use_container_width=True, key="web_update_btn")
+    web_rebuild_confirm = st.checkbox(
+        "I understand — reprocesses every website photo from scratch.",
+        value=False,
+        key="web_rebuild_confirm",
+    )
     web_rebuild_btn = st.button("Full website rebuild", type="secondary",
                                  use_container_width=True, key="web_rebuild_btn",
+                                 disabled=not web_rebuild_confirm,
                                  help="Reprocesses all website photos from scratch.")
 
     st.markdown("---")
@@ -891,7 +906,7 @@ if update_btn or rebuild_btn:
         existing = st.session_state.get("index") or load_index(service, folder_id)
         label = "Checking for new photos…"
     else:
-        label = "Rebuilding from scratch — this takes a few minutes…"
+        label = "Rebuilding from scratch — this can take hours to days for a library this size…"
 
     with st.spinner(label):
         bar = st.progress(0)
