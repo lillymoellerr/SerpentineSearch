@@ -312,6 +312,24 @@ def embed_image(pil_img: Image.Image):
     return feat.cpu().numpy().astype("float32")[0]
 
 
+def embed_image_onmodel(pil_img: Image.Image, weight: float = 0.75):
+    """
+    Same as embed_image, but nudged toward "worn on a person" in CLIP
+    space. A flat product photo and an on-model photo of the identical
+    piece can end up far apart in raw CLIP similarity, because the model
+    weighs overall composition (background, skin, lighting) heavily --
+    so pure image-to-image search keeps surfacing other flat product
+    shots instead of the correct piece being worn. Blending in a text
+    vector for "worn on a person / lifestyle photo" pulls the query
+    toward that region of the embedding space while still keeping most
+    of the weight on what the piece actually looks like.
+    """
+    img_vec = embed_image(pil_img)
+    text_vec = embed_text("worn on a person, on model, lifestyle photo, on a hand or neck")
+    blended = weight * img_vec + (1 - weight) * text_vec
+    return blended / np.linalg.norm(blended)
+
+
 # ── Helpers: Google Drive ─────────────────────────────────────────────────────
 def _execute_with_retry(request, max_retries: int = 4, base_delay: float = 1.0):
     """
@@ -389,10 +407,16 @@ def get_drive_service():
 
 def list_drive_images(service, folder_id: str) -> list[dict]:
     """Return all image files under a Drive folder (recursive)."""
-    results, page_token, seen = [], None, set()
+    # Drive files can have more than one parent folder (e.g. a photo filed
+    # under both a category subfolder and a "Winners" subfolder), so the
+    # same file id can turn up more than once while recursing. seen_files
+    # dedupes by file id so each photo is only embedded/indexed once --
+    # without this, multi-parented photos get double-counted and the index
+    # ends up with duplicate entries (inflated "photos indexed" totals but
+    # not wrong search results, since both entries point at the same photo).
+    results, seen_folders, seen_files = [], set(), set()
 
     def _recurse(fid):
-        nonlocal page_token
         q = f"'{fid}' in parents and trashed = false"
         pt = None
         while True:
@@ -403,11 +427,13 @@ def list_drive_images(service, folder_id: str) -> list[dict]:
             ))
             for item in resp.get("files", []):
                 if item["mimeType"] == "application/vnd.google-apps.folder":
-                    if item["id"] not in seen:
-                        seen.add(item["id"])
+                    if item["id"] not in seen_folders:
+                        seen_folders.add(item["id"])
                         _recurse(item["id"])
                 elif item["mimeType"].startswith("image/"):
-                    results.append(item)
+                    if item["id"] not in seen_files:
+                        seen_files.add(item["id"])
+                        results.append(item)
             pt = resp.get("nextPageToken")
             if not pt:
                 break
@@ -735,23 +761,45 @@ def _keyword_overlap(query_text: str, description: str) -> float:
     return len(q_words & d_words) / len(q_words)
 
 
+# Plain-camera filenames (IMG_1234.HEIC, IMG_1234.jpg, ...) tend to be
+# casual in-the-wild shots -- staff photographing a piece being worn --
+# rather than the studio product photography that gets deliberately
+# renamed. Not a guarantee, just a weak signal used for a small ranking
+# nudge when the user asks to prefer on-model/lifestyle shots.
+_CAMERA_ROLL_RE = re.compile(r"^img_\d+\.(jpe?g|heic|png)$", re.IGNORECASE)
+
+
+def _is_camera_roll_name(name: str) -> bool:
+    return bool(_CAMERA_ROLL_RE.match(name.strip()))
+
+
 def hybrid_search(drive_index, website_index, query_vec: np.ndarray,
-                   query_text: str, top_k: int) -> list[dict]:
+                   query_text: str, top_k: int,
+                   prefer_onmodel: bool = False) -> list[dict]:
     """
     Merge Drive-only results (pure CLIP similarity) with website results
     (CLIP similarity boosted by literal keyword overlap against the human-
     written description) into one ranked list.
+
+    When prefer_onmodel is set, Drive photos with camera-roll-style
+    filenames get a small score boost -- meant to be combined with a query
+    vector that's already been steered toward "worn on a person" via
+    embed_image_onmodel(), not a substitute for it.
     """
     results = []
 
     if drive_index is not None and len(drive_index["ids"]) > 0:
         sims = drive_index["embeddings"] @ query_vec
         for i in range(len(drive_index["ids"])):
+            name = drive_index["names"][i]
+            score = float(sims[i])
+            if prefer_onmodel and _is_camera_roll_name(name):
+                score *= 1.15
             results.append({
                 "source": "drive",
                 "id":     drive_index["ids"][i],
-                "name":   drive_index["names"][i],
-                "score":  float(sims[i]),
+                "name":   name,
+                "score":  score,
             })
 
     if website_index is not None and len(website_index["ids"]) > 0:
@@ -956,6 +1004,15 @@ with col_upload:
         label_visibility="collapsed",
     )
 
+prefer_onmodel = False
+if query_file:
+    prefer_onmodel = st.checkbox(
+        "Prefer on-model / lifestyle shots (piece being worn, not laid flat)",
+        value=False,
+        help="Steers the search toward photos of this piece being worn on "
+             "a person instead of flat product/catalog shots.",
+    )
+
 # ── Run search ────────────────────────────────────────────────────────────────
 results = []
 search_label = ""
@@ -964,8 +1021,9 @@ if query_file:
     pil_img = Image.open(query_file).convert("RGB")
     st.image(pil_img, caption="Reference photo", width=200)
     with st.spinner("Finding similar pieces…"):
-        qvec = embed_image(pil_img)
-    results = hybrid_search(index, website_index, qvec, "", top_k)
+        qvec = embed_image_onmodel(pil_img) if prefer_onmodel else embed_image(pil_img)
+    results = hybrid_search(index, website_index, qvec, "", top_k,
+                             prefer_onmodel=prefer_onmodel)
     search_label = "Visually similar to your photo"
 
 elif query_text.strip():
